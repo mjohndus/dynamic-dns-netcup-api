@@ -79,6 +79,17 @@
 #   65a. functions.php — TZ env var overrides a pinned date.timezone (e.g. alpine's compiled-in default)
 #   66. Docker entrypoint — args with embedded spaces survive the cron command
 #   67. Docker entrypoint — env-mode generated config files are mode 0600
+#   68. CloudDNS DynDNS — domain list parsing (getCloudDnsDomains, buildCloudDnsFqdn)
+#   69. CloudDNS DynDNS — pure-CloudDNS update flow (no CCP session, dual-stack single call)
+#   70. CloudDNS DynDNS — IPv4-only / IPv6-only requests
+#   71. CloudDNS DynDNS — "No record update needed." response
+#   72. CloudDNS DynDNS — API error responses (401, 400, 404, 500, invalid JSON)
+#   73. CloudDNS DynDNS — config validation (missing token, wildcard passthrough, no domains at all)
+#   74. CloudDNS DynDNS — mixed CCP + CloudDNS run (and domain-in-both-lists warning)
+#   75. CloudDNS DynDNS — CCP statuscode 5029 shows the CloudDNS migration hint
+#   76. CloudDNS DynDNS — caching (fingerprint invalidation, pure-CloudDNS cache hit)
+#   77. CloudDNS DynDNS — quiet mode still shows errors
+#   78. Docker entrypoint — env-mode CloudDNS DynDNS variables
 #
 
 set -uo pipefail
@@ -254,8 +265,22 @@ write_mock_config() {
     if echo "$overrides" | grep -q "CHANGE_TTL"; then
         change_ttl=$(echo "$overrides" | grep -oP "define\('CHANGE_TTL',\s*\K[^)]+")
     fi
-    if echo "$overrides" | grep -q "DOMAINLIST"; then
+    if echo "$overrides" | grep -q "define('DOMAINLIST',"; then
         domainlist=$(echo "$overrides" | grep -oP "define\('DOMAINLIST',\s*'\K[^']+")
+    fi
+
+    # Optional CloudDNS DynDNS overrides (appended only when present)
+    local clouddns_domainlist=""
+    local clouddns_token=""
+    local clouddns_apiurl=""
+    if echo "$overrides" | grep -q "DOMAINLIST_CLOUDDNS_DYNDNS"; then
+        clouddns_domainlist=$(echo "$overrides" | grep -oP "define\('DOMAINLIST_CLOUDDNS_DYNDNS',\s*'\K[^']+")
+    fi
+    if echo "$overrides" | grep -q "CLOUDDNS_DYNDNS_APIKEY"; then
+        clouddns_token=$(echo "$overrides" | grep -oP "define\('CLOUDDNS_DYNDNS_APIKEY',\s*'\K[^']+")
+    fi
+    if echo "$overrides" | grep -q "CLOUDDNS_DYNDNS_APIURL"; then
+        clouddns_apiurl=$(echo "$overrides" | grep -oP "define\('CLOUDDNS_DYNDNS_APIURL',\s*'\K[^']+")
     fi
 
     cat > "$TEST_CONFIG" <<PHPEOF
@@ -268,6 +293,58 @@ define('USE_IPV4', $use_ipv4);
 define('USE_IPV6', $use_ipv6);
 define('CHANGE_TTL', $change_ttl);
 define('DOMAINLIST', '$domainlist');
+define('IPV4_ADDRESS_URL', 'http://localhost:$MOCK_PORT/ipv4');
+define('IPV4_ADDRESS_URL_FALLBACK', 'http://localhost:$MOCK_PORT/ipv4');
+define('IPV6_ADDRESS_URL', 'http://localhost:$MOCK_PORT/ipv6');
+define('IPV6_ADDRESS_URL_FALLBACK', 'http://localhost:$MOCK_PORT/ipv6');
+define('RETRY_SLEEP', 0);
+define('JITTER_MAX', 0);
+define('CACHE_FILE', '/dev/null');
+PHPEOF
+
+    if [ -n "$clouddns_domainlist" ]; then
+        echo "define('DOMAINLIST_CLOUDDNS_DYNDNS', '$clouddns_domainlist');" >> "$TEST_CONFIG"
+    fi
+    if [ -n "$clouddns_token" ]; then
+        echo "define('CLOUDDNS_DYNDNS_APIKEY', '$clouddns_token');" >> "$TEST_CONFIG"
+    fi
+    if [ -n "$clouddns_apiurl" ]; then
+        echo "define('CLOUDDNS_DYNDNS_APIURL', '$clouddns_apiurl');" >> "$TEST_CONFIG"
+    fi
+}
+
+# Write a test config.php for pure-CloudDNS setups: deliberately contains NO
+# CUSTOMERNR/APIKEY/APIPASSWORD/APIURL/DOMAINLIST, proving that CloudDNS-only
+# configs do not need any CCP DNS API settings.
+# Usage: write_clouddns_config [dyndns_path] [override_defines] [token]
+# Overrides (same grep convention as write_mock_config): USE_IPV4, USE_IPV6,
+# DOMAINLIST_CLOUDDNS_DYNDNS.
+write_clouddns_config() {
+    local dyndns_path="${1:-/dyndns}"
+    local overrides="${2:-}"
+    local token="${3:-test-dyndns-token}"
+
+    local use_ipv4="true"
+    local use_ipv6="false"
+    local clouddns_domainlist="example.com: @, home"
+
+    if echo "$overrides" | grep -q "USE_IPV4"; then
+        use_ipv4=$(echo "$overrides" | grep -oP "define\('USE_IPV4',\s*\K[^)]+")
+    fi
+    if echo "$overrides" | grep -q "USE_IPV6"; then
+        use_ipv6=$(echo "$overrides" | grep -oP "define\('USE_IPV6',\s*\K[^)]+")
+    fi
+    if echo "$overrides" | grep -q "DOMAINLIST_CLOUDDNS_DYNDNS"; then
+        clouddns_domainlist=$(echo "$overrides" | grep -oP "define\('DOMAINLIST_CLOUDDNS_DYNDNS',\s*'\K[^']+")
+    fi
+
+    cat > "$TEST_CONFIG" <<PHPEOF
+<?php
+define('DOMAINLIST_CLOUDDNS_DYNDNS', '$clouddns_domainlist');
+define('CLOUDDNS_DYNDNS_APIKEY', '$token');
+define('CLOUDDNS_DYNDNS_APIURL', 'http://localhost:$MOCK_PORT$dyndns_path');
+define('USE_IPV4', $use_ipv4);
+define('USE_IPV6', $use_ipv6);
 define('IPV4_ADDRESS_URL', 'http://localhost:$MOCK_PORT/ipv4');
 define('IPV4_ADDRESS_URL_FALLBACK', 'http://localhost:$MOCK_PORT/ipv4');
 define('IPV6_ADDRESS_URL', 'http://localhost:$MOCK_PORT/ipv6');
@@ -398,7 +475,7 @@ echo "=== 2. CLI options ==="
 
 # --version / -v should print the version string and exit cleanly.
 assert_exit_code "--version exits 0" 0 php "$PROJECT_DIR/update.php" --version
-assert_output_contains "--version shows version number" "6.2.1" php "$PROJECT_DIR/update.php" --version
+assert_output_contains "--version shows version number" "7.0.0" php "$PROJECT_DIR/update.php" --version
 assert_exit_code "-v exits 0" 0 php "$PROJECT_DIR/update.php" -v
 
 # --help / -h should print usage information and exit cleanly.
@@ -1159,7 +1236,7 @@ echo ""
 echo "  --- 39. Cache hit (skips API) ---"
 CACHE_TMP="$SCRIPT_DIR/cache.test.json"
 # Compute the config hash matching the test config (DOMAINLIST='example.com: @', USE_IPV4=true, USE_IPV6=false, CHANGE_TTL=false)
-CACHE_HASH=$(php -r "echo md5(json_encode(array('domainlist'=>'example.com: @','use_ipv4'=>true,'use_ipv6'=>false,'change_ttl'=>false)));")
+CACHE_HASH=$(php -r "echo md5(json_encode(array('domainlist'=>'example.com: @','domainlist_clouddns'=>'','use_ipv4'=>true,'use_ipv6'=>false,'change_ttl'=>false)));")
 echo "{\"config_hash\":\"$CACHE_HASH\",\"ipv4\":\"203.0.113.42\"}" > "$CACHE_TMP"
 cat > "$TEST_CONFIG" <<PHPEOF
 <?php
@@ -2466,6 +2543,515 @@ else
     fail "mounted config.php's mode is left untouched (got '$mounted_mode')"
 fi
 rm -rf "$ENTRYPOINT_TMP"
+
+# ===========================================================================
+# 68. CLOUDDNS DYNDNS — DOMAIN LIST PARSING (unit)
+# ===========================================================================
+
+echo ""
+echo "=== 68. CloudDNS DynDNS domain list parsing ==="
+
+# getCloudDnsDomains() parses the same syntax as DOMAINLIST
+run_php_custom \
+    "define('DOMAINLIST_CLOUDDNS_DYNDNS','cloud.com: @, home; other.de: www');
+     define('CLOUDDNS_DYNDNS_APIKEY','t');" \
+    '
+    $result = getCloudDnsDomains();
+    $expected = ["cloud.com" => ["@", "home"], "other.de" => ["www"]];
+    if ($result === $expected) { echo "OK"; } else { echo "FAIL"; var_dump($result); }
+' | grep -q "OK" && pass "parses DOMAINLIST_CLOUDDNS_DYNDNS" || fail "parses DOMAINLIST_CLOUDDNS_DYNDNS"
+
+# getCloudDnsDomains() returns an empty array when the constant is undefined
+run_php '
+    if (getCloudDnsDomains() === []) { echo "OK"; } else { echo "FAIL"; }
+' | grep -q "OK" && pass "returns empty array without DOMAINLIST_CLOUDDNS_DYNDNS" || fail "returns empty array without DOMAINLIST_CLOUDDNS_DYNDNS"
+
+# buildCloudDnsFqdn() maps '@' to the bare domain and prefixes subdomains
+run_php '
+    if (buildCloudDnsFqdn("@", "example.com") === "example.com"
+        && buildCloudDnsFqdn("home", "example.com") === "home.example.com") {
+        echo "OK";
+    } else {
+        echo "FAIL";
+    }
+' | grep -q "OK" && pass "buildCloudDnsFqdn maps @ and subdomains correctly" || fail "buildCloudDnsFqdn maps @ and subdomains correctly"
+
+# A pure-CloudDNS config is valid: getDomains() returns an empty array and
+# does NOT trigger the legacy DOMAIN/HOST deprecation warning.
+local_config="${UNIT_CONFIG}.clouddns1.php"
+cat > "$local_config" <<'CDEOF'
+<?php
+define('DOMAINLIST_CLOUDDNS_DYNDNS','cloud.com: @');
+define('CLOUDDNS_DYNDNS_APIKEY','t');
+CDEOF
+clouddns_out=$(php -- -c "$local_config" <<CDPHP 2>&1
+<?php
+require '$PROJECT_DIR/functions.php';
+var_export(getDomains());
+CDPHP
+)
+if echo "$clouddns_out" | grep -qF "array ("; then
+    pass "getDomains returns empty array for pure-CloudDNS config"
+else
+    fail "getDomains returns empty array for pure-CloudDNS config (got: $clouddns_out)"
+fi
+if echo "$clouddns_out" | grep -qF "outdated configuration"; then
+    fail "pure-CloudDNS config does not trigger the legacy deprecation warning"
+else
+    pass "pure-CloudDNS config does not trigger the legacy deprecation warning"
+fi
+rm -f "$local_config"
+
+# Wildcard subdomains are supported by the DynDNS API and passed through as-is.
+local_config="${UNIT_CONFIG}.clouddns2.php"
+cat > "$local_config" <<'CDEOF'
+<?php
+define('DOMAINLIST_CLOUDDNS_DYNDNS','cloud.com: @, *');
+define('CLOUDDNS_DYNDNS_APIKEY','t');
+CDEOF
+wildcard_out=$(php -- -c "$local_config" <<CDPHP 2>&1
+<?php
+require '$PROJECT_DIR/functions.php';
+echo json_encode(getCloudDnsDomains());
+CDPHP
+)
+wildcard_status=$?
+if [ "$wildcard_status" -eq 0 ] && echo "$wildcard_out" | grep -qF '{"cloud.com":["@","*"]}'; then
+    pass "wildcard in DOMAINLIST_CLOUDDNS_DYNDNS is kept"
+else
+    fail "wildcard in DOMAINLIST_CLOUDDNS_DYNDNS is kept (status=$wildcard_status, got: $wildcard_out)"
+fi
+rm -f "$local_config"
+
+# ===========================================================================
+# 69-77. CLOUDDNS DYNDNS — FULL UPDATE FLOW (mock server)
+# ===========================================================================
+
+echo ""
+echo "=== 69-77. CloudDNS DynDNS full update flow (mock server) ==="
+
+if [ -z "$MOCK_PID" ]; then
+    echo "  SKIP: mock server not running (cURL PHP extension or python3 missing) — skipping CloudDNS DynDNS integration tests"
+else
+
+# --- 69. Pure CloudDNS: dual-stack, no CCP session ---
+echo ""
+echo "  --- 69. Pure CloudDNS (dual-stack, no CCP session) ---"
+reset_mock_server
+write_clouddns_config /dyndns "define('USE_IPV6', true)"
+run_update
+assert_run_exit "exits 0" 0
+assert_output "reports saved records" "Record(s) have been saved."
+assert_output "announces CloudDNS domain" 'Beginning work on CloudDNS domain "example.com"'
+assert_output "updates root fqdn" 'Updating DNS records for "example.com" via the CloudDNS DynDNS API'
+assert_output "updates subdomain fqdn" 'Updating DNS records for "home.example.com" via the CloudDNS DynDNS API'
+assert_output_missing "no CCP login" "Logged in successfully"
+assert_output_missing "no CCP logout" "Logged out successfully"
+dyndns_log=$(curl -s "http://localhost:$MOCK_PORT/dyndns-log")
+dyndns_count=$(printf '%s' "$dyndns_log" | grep -oF '"path": "/dyndns"' | wc -l | tr -d '[:space:]')
+if [ "$dyndns_count" -eq 2 ]; then
+    pass "one request per fqdn (2 total)"
+else
+    fail "one request per fqdn (expected 2, got $dyndns_count)"
+fi
+v4_count=$(printf '%s' "$dyndns_log" | grep -oF '"ipv4Address": "203.0.113.42"' | wc -l | tr -d '[:space:]')
+v6_count=$(printf '%s' "$dyndns_log" | grep -oF '"ipv6Address": "2001:db8::42"' | wc -l | tr -d '[:space:]')
+if [ "$v4_count" -eq 2 ] && [ "$v6_count" -eq 2 ]; then
+    pass "each request carries ipv4Address and ipv6Address in a single call"
+else
+    fail "each request carries both addresses (ipv4: $v4_count/2, ipv6: $v6_count/2)"
+fi
+echo "$dyndns_log" | grep -qF '"fqdn": "example.com"' \
+    && pass "root fqdn sent as bare domain" || fail "root fqdn sent as bare domain"
+echo "$dyndns_log" | grep -qF '"fqdn": "home.example.com"' \
+    && pass "subdomain fqdn built correctly" || fail "subdomain fqdn built correctly"
+echo "$dyndns_log" | grep -qF '"token": "test-dyndns-token"' \
+    && pass "token sent in the POST body" || fail "token sent in the POST body"
+echo "$dyndns_log" | grep -qF '"action": "update"' \
+    && pass "action=update sent" || fail "action=update sent"
+
+# --- 70. IPv4-only / IPv6-only requests ---
+echo ""
+echo "  --- 70. IPv4-only / IPv6-only ---"
+reset_mock_server
+write_clouddns_config /dyndns
+run_update
+assert_run_exit "IPv4-only exits 0" 0
+dyndns_log=$(curl -s "http://localhost:$MOCK_PORT/dyndns-log")
+echo "$dyndns_log" | grep -qF '"ipv4Address"' \
+    && pass "IPv4-only request contains ipv4Address" || fail "IPv4-only request contains ipv4Address"
+if echo "$dyndns_log" | grep -qF '"ipv6Address"'; then
+    fail "IPv4-only request omits ipv6Address"
+else
+    pass "IPv4-only request omits ipv6Address"
+fi
+reset_mock_server
+write_clouddns_config /dyndns "define('USE_IPV4', false) define('USE_IPV6', true)"
+run_update
+assert_run_exit "IPv6-only exits 0" 0
+dyndns_log=$(curl -s "http://localhost:$MOCK_PORT/dyndns-log")
+echo "$dyndns_log" | grep -qF '"ipv6Address"' \
+    && pass "IPv6-only request contains ipv6Address" || fail "IPv6-only request contains ipv6Address"
+if echo "$dyndns_log" | grep -qF '"ipv4Address"'; then
+    fail "IPv6-only request omits ipv4Address"
+else
+    pass "IPv6-only request omits ipv4Address"
+fi
+
+# --- 71. "No record update needed." response ---
+echo ""
+echo "  --- 71. No record update needed ---"
+write_clouddns_config /dyndns-nochange
+run_update
+assert_run_exit "exits 0" 0
+assert_output "reports no update needed" "No record update needed."
+
+# --- 72. API error responses ---
+echo ""
+echo "  --- 72. API error responses ---"
+write_clouddns_config /dyndns-unauthorized
+run_update
+assert_run_exit "401 exits 1" 1
+assert_output "401 message surfaced" "Unable to authenticate with provided token."
+assert_output "401 shows HTTP status" "HTTP 401"
+assert_output "401 shows the token hint" "CLOUDDNS_DYNDNS_APIKEY"
+
+# A wrong token against the validating /dyndns endpoint also gets the hint
+write_clouddns_config /dyndns "" "wrong-token"
+run_update
+assert_run_exit "wrong token exits 1" 1
+assert_output "wrong token gets the API-key hint" "NOT a Legacy API key"
+
+write_clouddns_config /dyndns-not-clouddns
+run_update
+assert_run_exit "400 not-CloudDNS exits 1" 1
+assert_output "400 message surfaced" "This domain is not managed through CloudDNS"
+
+write_clouddns_config /dyndns-notfound
+run_update
+assert_run_exit "404 exits 1" 1
+assert_output "404 message surfaced" "No matching domain for the given 'fqdn' was found in your account."
+
+reset_mock_server
+write_clouddns_config /dyndns-500
+run_update
+assert_run_exit "500 exits 1" 1
+assert_output "500 fails after retries" "Max retries reached"
+assert_output_missing "500 produces no PHP warnings" "PHP Warning"
+attempt_count=$(curl -s "http://localhost:$MOCK_PORT/dyndns-log" | grep -oF '"path": "/dyndns-500"' | wc -l | tr -d '[:space:]')
+if [ "$attempt_count" -eq 3 ]; then
+    pass "HTTP 500 is retried 3 times"
+else
+    fail "HTTP 500 is retried 3 times (got $attempt_count attempts)"
+fi
+
+write_clouddns_config /dyndns-invalid-json
+run_update
+assert_run_exit "invalid JSON body exits 1" 1
+assert_output "invalid JSON fails after retries" "Max retries reached"
+assert_output_missing "invalid JSON produces no PHP warnings" "PHP Warning"
+
+# --- 73. Config validation ---
+echo ""
+echo "  --- 73. Config validation ---"
+# Missing token: fails before any network request
+reset_mock_server
+cat > "$TEST_CONFIG" <<PHPEOF
+<?php
+define('DOMAINLIST_CLOUDDNS_DYNDNS', 'example.com: @');
+define('CLOUDDNS_DYNDNS_APIURL', 'http://localhost:$MOCK_PORT/dyndns');
+define('USE_IPV4', true);
+define('USE_IPV6', false);
+define('IPV4_ADDRESS_URL', 'http://localhost:$MOCK_PORT/ipv4');
+define('IPV4_ADDRESS_URL_FALLBACK', 'http://localhost:$MOCK_PORT/ipv4');
+define('RETRY_SLEEP', 0);
+define('JITTER_MAX', 0);
+define('CACHE_FILE', '/dev/null');
+PHPEOF
+run_update
+assert_run_exit "missing token exits 1" 1
+assert_output "missing token names the constant" "CLOUDDNS_DYNDNS_APIKEY is missing or empty"
+dyndns_log=$(curl -s "http://localhost:$MOCK_PORT/dyndns-log")
+if [ "$dyndns_log" = "[]" ]; then
+    pass "missing token: no request reaches the DynDNS API"
+else
+    fail "missing token: no request reaches the DynDNS API (log: $dyndns_log)"
+fi
+
+# Wildcard through the full update.php flow: sent as *.domain.tld
+reset_mock_server
+write_clouddns_config /dyndns "define('DOMAINLIST_CLOUDDNS_DYNDNS', 'example.com: @, *')"
+run_update
+assert_run_exit "wildcard run exits 0" 0
+assert_output_missing "wildcard produces no wildcard warning" "Wildcard"
+curl -s "http://localhost:$MOCK_PORT/dyndns-log" | grep -qF '"fqdn": "*.example.com"' \
+    && pass "wildcard update sent as *.example.com" || fail "wildcard update sent as *.example.com"
+
+# Both lists defined but empty
+cat > "$TEST_CONFIG" <<PHPEOF
+<?php
+define('DOMAINLIST', '');
+define('DOMAINLIST_CLOUDDNS_DYNDNS', '');
+define('CLOUDDNS_DYNDNS_APIKEY', 'test-dyndns-token');
+define('USE_IPV4', true);
+define('USE_IPV6', false);
+define('IPV4_ADDRESS_URL', 'http://localhost:$MOCK_PORT/ipv4');
+define('IPV4_ADDRESS_URL_FALLBACK', 'http://localhost:$MOCK_PORT/ipv4');
+define('RETRY_SLEEP', 0);
+define('JITTER_MAX', 0);
+define('CACHE_FILE', '/dev/null');
+PHPEOF
+run_update
+assert_run_exit "no domains at all exits 1" 1
+assert_output "no-domains message" "does not contain any domains to update"
+
+# --- 74. Mixed CCP + CloudDNS run ---
+echo ""
+echo "  --- 74. Mixed CCP + CloudDNS run ---"
+reset_mock_server
+write_mock_config /api "define('DOMAINLIST_CLOUDDNS_DYNDNS', 'cloudexample.com: home') define('CLOUDDNS_DYNDNS_APIKEY', 'test-dyndns-token') define('CLOUDDNS_DYNDNS_APIURL', 'http://localhost:$MOCK_PORT/dyndns')"
+run_update
+assert_run_exit "exits 0" 0
+assert_output "CCP login happens" "Logged in successfully"
+assert_output "CCP logout happens" "Logged out successfully"
+assert_output "CloudDNS domain processed" 'Beginning work on CloudDNS domain "cloudexample.com"'
+assert_output "CloudDNS record saved" "Record(s) have been saved."
+logout_line=$(echo "$output" | grep -nF "Logged out successfully" | head -1 | cut -d: -f1)
+clouddns_line=$(echo "$output" | grep -nF "Beginning work on CloudDNS domain" | head -1 | cut -d: -f1)
+if [ -n "$logout_line" ] && [ -n "$clouddns_line" ] && [ "$clouddns_line" -gt "$logout_line" ]; then
+    pass "CloudDNS updates run after the CCP session is closed"
+else
+    fail "CloudDNS updates run after the CCP session is closed (logout line: $logout_line, CloudDNS line: $clouddns_line)"
+fi
+curl -s "http://localhost:$MOCK_PORT/dyndns-log" | grep -qF '"fqdn": "home.cloudexample.com"' \
+    && pass "mixed run sends the CloudDNS fqdn" || fail "mixed run sends the CloudDNS fqdn"
+
+# A domain listed in BOTH lists produces a warning (but still runs)
+write_mock_config /api "define('DOMAINLIST_CLOUDDNS_DYNDNS', 'example.com: home') define('CLOUDDNS_DYNDNS_APIKEY', 'test-dyndns-token') define('CLOUDDNS_DYNDNS_APIURL', 'http://localhost:$MOCK_PORT/dyndns')"
+run_update
+assert_run_exit "both-lists run exits 0" 0
+assert_output "warns about domain in both lists" "configured in DOMAINLIST as well as DOMAINLIST_CLOUDDNS_DYNDNS"
+
+# --- 75. CCP statuscode 5029 shows the CloudDNS migration hint ---
+echo ""
+echo "  --- 75. Statuscode 5029 shows CloudDNS hint ---"
+write_mock_config /api-5029
+run_update
+assert_run_exit "exits 1" 1
+assert_output "surfaces the API longmessage" "does not example.com contain any DNS records"
+assert_output "hints at CloudDNS migration" "migrated to netcup CloudDNS"
+assert_output "points to DOMAINLIST_CLOUDDNS_DYNDNS" "DOMAINLIST_CLOUDDNS_DYNDNS"
+assert_output "links issue 42" "issues/42"
+
+# --- 76. Caching ---
+echo ""
+echo "  --- 76. Caching with CloudDNS domains ---"
+# 76a: adding a CloudDNS list changes the config fingerprint → cache miss
+CACHE_TMP="$SCRIPT_DIR/cache.test.json"
+echo "{\"config_hash\":\"$CACHE_HASH\",\"ipv4\":\"203.0.113.42\"}" > "$CACHE_TMP"
+cat > "$TEST_CONFIG" <<PHPEOF
+<?php
+define('CUSTOMERNR', '12345');
+define('APIKEY', 'testkey');
+define('APIPASSWORD', 'testpass');
+define('APIURL', 'http://localhost:$MOCK_PORT/api');
+define('USE_IPV4', true);
+define('USE_IPV6', false);
+define('CHANGE_TTL', false);
+define('DOMAINLIST', 'example.com: @');
+define('DOMAINLIST_CLOUDDNS_DYNDNS', 'cloudexample.com: home');
+define('CLOUDDNS_DYNDNS_APIKEY', 'test-dyndns-token');
+define('CLOUDDNS_DYNDNS_APIURL', 'http://localhost:$MOCK_PORT/dyndns');
+define('IPV4_ADDRESS_URL', 'http://localhost:$MOCK_PORT/ipv4');
+define('IPV4_ADDRESS_URL_FALLBACK', 'http://localhost:$MOCK_PORT/ipv4');
+define('IPV6_ADDRESS_URL', 'http://localhost:$MOCK_PORT/ipv6');
+define('IPV6_ADDRESS_URL_FALLBACK', 'http://localhost:$MOCK_PORT/ipv6');
+define('RETRY_SLEEP', 0);
+define('JITTER_MAX', 0);
+define('CACHE_FILE', '$CACHE_TMP');
+PHPEOF
+run_update
+assert_run_exit "exits 0" 0
+assert_output "adding a CloudDNS list invalidates the cache" "Logged in successfully"
+assert_output_missing "no stale cache hit" "cached"
+rm -f "$CACHE_TMP"
+
+# 76b: pure-CloudDNS runs write and honor the cache
+rm -f "$CACHE_TMP"
+cat > "$TEST_CONFIG" <<PHPEOF
+<?php
+define('DOMAINLIST_CLOUDDNS_DYNDNS', 'example.com: @, home');
+define('CLOUDDNS_DYNDNS_APIKEY', 'test-dyndns-token');
+define('CLOUDDNS_DYNDNS_APIURL', 'http://localhost:$MOCK_PORT/dyndns');
+define('USE_IPV4', true);
+define('USE_IPV6', false);
+define('IPV4_ADDRESS_URL', 'http://localhost:$MOCK_PORT/ipv4');
+define('IPV4_ADDRESS_URL_FALLBACK', 'http://localhost:$MOCK_PORT/ipv4');
+define('RETRY_SLEEP', 0);
+define('JITTER_MAX', 0);
+define('CACHE_FILE', '$CACHE_TMP');
+PHPEOF
+run_update
+assert_run_exit "first pure-CloudDNS run exits 0" 0
+assert_output "first run updates records" "Record(s) have been saved."
+reset_mock_server
+run_update
+assert_run_exit "second run exits 0" 0
+assert_output "second run hits the cache" "IP address hasn't changed since last run (cached)"
+dyndns_log=$(curl -s "http://localhost:$MOCK_PORT/dyndns-log")
+if [ "$dyndns_log" = "[]" ]; then
+    pass "cache hit makes no DynDNS requests"
+else
+    fail "cache hit makes no DynDNS requests (log: $dyndns_log)"
+fi
+rm -f "$CACHE_TMP"
+
+# --- 77. Quiet mode still shows errors ---
+echo ""
+echo "  --- 77. Quiet mode ---"
+write_clouddns_config /dyndns-unauthorized
+run_update --quiet
+assert_run_exit "quiet error run exits 1" 1
+assert_output "quiet mode still shows errors" "[ERROR]"
+assert_output_missing "quiet mode suppresses notices" "[NOTICE]"
+
+fi  # end of CloudDNS DynDNS mock-server availability check
+
+# ===========================================================================
+# 78. DOCKER ENTRYPOINT — ENV-MODE CLOUDDNS DYNDNS VARIABLES
+# ===========================================================================
+
+echo ""
+echo "=== 78. Docker entrypoint env-mode CloudDNS DynDNS variables ==="
+
+# --- Pure-CloudDNS env config: no CCP variables needed at all ---
+ENV_TMP="$(mktemp -d)"
+ENV_APP="$ENV_TMP/app"
+ENV_BIN="$ENV_TMP/bin"
+mkdir -p "$ENV_APP/data" "$ENV_BIN"
+make_entrypoint_mocks "$ENV_BIN" "$ENV_APP"
+CLOUDDNS_TEST_TOKEN="to'ken\\special"
+env_output=$(
+    env -i \
+        PATH="$ENV_BIN:$PATH" \
+        APP_DIR="$ENV_APP" \
+        DOMAINLIST_CLOUDDNS_DYNDNS="cloud.example: @, home" \
+        CLOUDDNS_DYNDNS_APIKEY="$CLOUDDNS_TEST_TOKEN" \
+        sh "$PROJECT_DIR/docker-entrypoint.sh" --quiet 2>&1
+) && env_status=$? || env_status=$?
+if [ "$env_status" -eq 0 ]; then
+    pass "pure-CloudDNS env-mode exits 0 without CCP variables"
+else
+    fail "pure-CloudDNS env-mode exits 0 without CCP variables (got $env_status; output: $env_output)"
+fi
+if php -l "$ENV_APP/config.php" > /dev/null 2>&1; then
+    pass "pure-CloudDNS generated config.php has valid PHP syntax"
+else
+    fail "pure-CloudDNS generated config.php has valid PHP syntax"
+fi
+if grep -qF "define('DOMAINLIST_CLOUDDNS_DYNDNS', 'cloud.example: @, home');" "$ENV_APP/config.php"; then
+    pass "generated config contains DOMAINLIST_CLOUDDNS_DYNDNS"
+else
+    fail "generated config contains DOMAINLIST_CLOUDDNS_DYNDNS"
+fi
+if grep -qF "CUSTOMERNR" "$ENV_APP/config.php"; then
+    fail "pure-CloudDNS config contains no CCP constants"
+else
+    pass "pure-CloudDNS config contains no CCP constants"
+fi
+recovered_token=$(php -r "require '$ENV_APP/config.php'; echo CLOUDDNS_DYNDNS_APIKEY;" 2>/dev/null)
+if [ "$recovered_token" = "$CLOUDDNS_TEST_TOKEN" ]; then
+    pass "token with special characters round-trips byte-for-byte"
+else
+    fail "token with special characters round-trips byte-for-byte (got '$recovered_token')"
+fi
+if grep -qF "CLOUDDNS_DYNDNS_APIURL" "$ENV_APP/config.php"; then
+    fail "CLOUDDNS_DYNDNS_APIURL omitted when not provided"
+else
+    pass "CLOUDDNS_DYNDNS_APIURL omitted when not provided"
+fi
+rm -rf "$ENV_TMP"
+
+# --- CLOUDDNS_DYNDNS_APIURL emitted when set ---
+ENV_TMP="$(mktemp -d)"
+ENV_APP="$ENV_TMP/app"
+ENV_BIN="$ENV_TMP/bin"
+mkdir -p "$ENV_APP/data" "$ENV_BIN"
+make_entrypoint_mocks "$ENV_BIN" "$ENV_APP"
+env -i \
+    PATH="$ENV_BIN:$PATH" \
+    APP_DIR="$ENV_APP" \
+    DOMAINLIST_CLOUDDNS_DYNDNS="cloud.example: @" \
+    CLOUDDNS_DYNDNS_APIKEY="t" \
+    CLOUDDNS_DYNDNS_APIURL="https://dyndns.example/ws" \
+    sh "$PROJECT_DIR/docker-entrypoint.sh" --quiet > /dev/null 2>&1
+dyndns_url=$(php -r "require '$ENV_APP/config.php'; echo CLOUDDNS_DYNDNS_APIURL;" 2>/dev/null)
+if [ "$dyndns_url" = "https://dyndns.example/ws" ]; then
+    pass "CLOUDDNS_DYNDNS_APIURL override applied to generated config"
+else
+    fail "CLOUDDNS_DYNDNS_APIURL override applied (got '$dyndns_url')"
+fi
+rm -rf "$ENV_TMP"
+
+# --- Neither DOMAINLIST nor DOMAINLIST_CLOUDDNS_DYNDNS set → clear error ---
+ENV_TMP="$(mktemp -d)"
+ENV_APP="$ENV_TMP/app"
+ENV_BIN="$ENV_TMP/bin"
+mkdir -p "$ENV_APP/data" "$ENV_BIN"
+make_entrypoint_mocks "$ENV_BIN" "$ENV_APP"
+env_output=$(
+    env -i \
+        PATH="$ENV_BIN:$PATH" \
+        APP_DIR="$ENV_APP" \
+        CUSTOMERNR=1 APIKEY=k APIPASSWORD=p \
+        sh "$PROJECT_DIR/docker-entrypoint.sh" 2>&1
+) && env_status=$? || env_status=$?
+if [ "$env_status" -eq 1 ]; then
+    pass "no domain list at all exits 1"
+else
+    fail "no domain list at all exits 1 (got $env_status)"
+fi
+if echo "$env_output" | grep -qF "DOMAINLIST" && echo "$env_output" | grep -qF "DOMAINLIST_CLOUDDNS_DYNDNS"; then
+    pass "error mentions both domain list variables"
+else
+    fail "error mentions both domain list variables (output: $env_output)"
+fi
+if [ ! -f "$ENV_APP/config.php" ]; then
+    pass "no partial config.php written without a domain list"
+else
+    fail "no partial config.php written without a domain list"
+fi
+rm -rf "$ENV_TMP"
+
+# --- CloudDNS list without token → error names CLOUDDNS_DYNDNS_APIKEY ---
+ENV_TMP="$(mktemp -d)"
+ENV_APP="$ENV_TMP/app"
+ENV_BIN="$ENV_TMP/bin"
+mkdir -p "$ENV_APP/data" "$ENV_BIN"
+make_entrypoint_mocks "$ENV_BIN" "$ENV_APP"
+env_output=$(
+    env -i \
+        PATH="$ENV_BIN:$PATH" \
+        APP_DIR="$ENV_APP" \
+        DOMAINLIST_CLOUDDNS_DYNDNS="cloud.example: @" \
+        sh "$PROJECT_DIR/docker-entrypoint.sh" 2>&1
+) && env_status=$? || env_status=$?
+if [ "$env_status" -eq 1 ]; then
+    pass "CloudDNS list without token exits 1"
+else
+    fail "CloudDNS list without token exits 1 (got $env_status)"
+fi
+if echo "$env_output" | grep -qF "CLOUDDNS_DYNDNS_APIKEY"; then
+    pass "error names CLOUDDNS_DYNDNS_APIKEY"
+else
+    fail "error names CLOUDDNS_DYNDNS_APIKEY (output: $env_output)"
+fi
+if [ ! -f "$ENV_APP/config.php" ]; then
+    pass "no partial config.php written without the token"
+else
+    fail "no partial config.php written without the token"
+fi
+rm -rf "$ENV_TMP"
 
 # ===========================================================================
 # RESULTS

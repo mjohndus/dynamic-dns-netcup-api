@@ -2,7 +2,7 @@
 
 ## Project overview
 
-Dynamic DNS client for the netcup CCP DNS API, written in PHP. Updates A/AAAA DNS records with the current public IP address. Designed to run as a cron job.
+Dynamic DNS client for the netcup DNS APIs, written in PHP. Updates A/AAAA DNS records with the current public IP address. Designed to run as a cron job. Talks to two netcup APIs: the classic CCP DNS API (session-based JSON POST, domains in `DOMAINLIST`) and the CloudDNS DynDNS API (`wsDynDns.php`, token-authenticated form POST, domains in `DOMAINLIST_CLOUDDNS_DYNDNS`) for domains migrated to netcup CloudDNS, which the CCP API can no longer manage (it returns statuscode 5029, see issue #42).
 
 ## Architecture
 
@@ -24,7 +24,7 @@ Three source files, no framework, no dependencies beyond PHP-CLI with cURL:
 Run tests with `./tests/test.sh`. Requires Bash, PHP-CLI, and Python 3.
 
 - Unit tests (IP validation, domain parsing) work without cURL by loading `functions.php` with a dummy config via `php -- -c <config> -q`.
-- Integration tests use `test_mock_server.py` — a Python HTTP server simulating both IP lookup services and the netcup API. It listens on dual-stack (IPv4+IPv6) and has 13 API endpoint variants for different scenarios.
+- Integration tests use `test_mock_server.py` — a Python HTTP server simulating IP lookup services, the netcup CCP API (18 `/api*` JSON endpoint variants), and the CloudDNS DynDNS API (form-POST `/dyndns*` variants; received requests are queryable via GET `/dyndns-log` for assertions). It listens on dual-stack (IPv4+IPv6).
 - Test configs set `RETRY_SLEEP=0`, `JITTER_MAX=0`, and `CACHE_FILE=/dev/null` to avoid delays and side effects.
 - Cache-specific tests use a temp file (`cache.test.json`) and compute the expected config fingerprint dynamically.
 
@@ -32,16 +32,17 @@ Run tests with `./tests/test.sh`. Requires Bash, PHP-CLI, and Python 3.
 
 - **Retry logic:** `executeCurlWithRetries()` handles API retries. `fetchIPWithFallback()` handles IP lookup retries with validation + fallback URL. Both use `RETRY_SLEEP` (default 30s) between attempts.
 - **IP version forcing:** `CURL_IPRESOLVE_V4` / `CURL_IPRESOLVE_V6` is passed through `fetchIPWithFallback()` → `initializeCurlHandlerGetIP()` to prevent dual-stack servers from returning the wrong address type.
-- **Cache invalidation:** The cache stores a config fingerprint (md5 of DOMAINLIST, USE_IPV4, USE_IPV6, CHANGE_TTL). Config changes automatically invalidate the cache.
+- **Cache invalidation:** The cache stores a config fingerprint (md5 of DOMAINLIST, DOMAINLIST_CLOUDDNS_DYNDNS, USE_IPV4, USE_IPV6, CHANGE_TTL). Config changes automatically invalidate the cache.
 - **Session expiry workaround:** The netcup API has a bug where sessions expire early (error 4001). `sendRequest()` catches this, re-logs in, and retries once.
 - **Unified record update:** `updateDnsRecordsForIP()` handles finding, creating, and updating DNS records for a given subdomain and record type (A or AAAA). Called from `update.php` for each IP version, avoiding duplicated IPv4/IPv6 logic.
+- **CloudDNS DynDNS path:** `updateCloudDnsDynDns()` form-POSTs to `CLOUDDNS_DYNDNS_APIURL` with `CLOUDDNS_DYNDNS_APIKEY` — no session, no `CURLOPT_FAILONERROR` (error bodies carry the JSON message), one call per fqdn updating A and AAAA together. The CCP block in `update.php` is skipped entirely (no login, no CCP credentials required) when `DOMAINLIST` is empty; the CloudDNS loop runs after CCP logout. Wildcard (`*`) subdomains are sent as `*.domain.tld` (confirmed working against the real API). `CHANGE_TTL` does not apply — the API itself sets the TTL of created/updated records to 300s (confirmed by manual testing).
 
 ## Common tasks
 
 - **Adding a new config option:** Add `define()` in `config.dist.php` (documented), add `!defined()` default guard in `update.php`, add to `write_mock_config` in `test.sh` if it affects test behavior. If the option should be settable via Docker env vars, also extend `generate_config_from_env` in `docker-entrypoint.sh` and the env-var docs in `README.md`.
 - **Adding a new API mock variant:** Add handler method in `test_mock_server.py`, add to the dispatch dict, write tests in `test.sh`.
 - **Bumping version:** Change `const VERSION` in `functions.php` line 3. Update the version check in `test.sh` (search for the old version string).
-- **Docker image:** The `Dockerfile` copies only `update.php`, `functions.php`, and `healthcheck.php` (via `.dockerignore`). The `docker-entrypoint.sh` produces `config.docker.php`, a wrapper that requires the user's `config.php` and sets `CACHE_FILE` to the persistent volume. The user's `config.php` can be mounted directly OR generated from env vars (`CUSTOMERNR`, `APIKEY`, `APIPASSWORD`, `DOMAINLIST`, plus optional `USE_IPV4` / `USE_IPV6` / `CHANGE_TTL` / IP-URL / `RETRY_SLEEP` / `JITTER_MAX` / `APIURL`) — a mounted file always wins. A GitHub Actions workflow (`.github/workflows/docker-publish.yml`) automatically builds and pushes the Docker image to Docker Hub when a release is published.
+- **Docker image:** The `Dockerfile` copies only `update.php`, `functions.php`, and `healthcheck.php` (via `.dockerignore`). The `docker-entrypoint.sh` produces `config.docker.php`, a wrapper that requires the user's `config.php` and sets `CACHE_FILE` to the persistent volume. The user's `config.php` can be mounted directly OR generated from env vars (`DOMAINLIST` + `CUSTOMERNR`/`APIKEY`/`APIPASSWORD` for the CCP API, and/or `DOMAINLIST_CLOUDDNS_DYNDNS` + `CLOUDDNS_DYNDNS_APIKEY` for CloudDNS, plus optional `USE_IPV4` / `USE_IPV6` / `CHANGE_TTL` / IP-URL / `RETRY_SLEEP` / `JITTER_MAX` / `APIURL` / `CLOUDDNS_DYNDNS_APIURL`) — a mounted file always wins. A GitHub Actions workflow (`.github/workflows/docker-publish.yml`) automatically builds and pushes the Docker image to Docker Hub when a release is published.
 
 **Important:** After any user-facing change (new feature, new CLI option, changed behavior), update `README.md` to match. Keep the CLI options table in `README.md` identical to the help text in `functions.php`. Update the feature list if applicable.
 

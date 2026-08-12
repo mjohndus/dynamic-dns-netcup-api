@@ -5,6 +5,7 @@ Simulates:
   - IP address lookup services (IPv4 and IPv6)
   - netcup CCP DNS API (login, logout, infoDnsZone, infoDnsRecords,
     updateDnsRecords, updateDnsZone)
+  - netcup CloudDNS DynDNS API (wsDynDns.php, form-encoded POST)
 
 GET endpoints (IP lookup):
   /health          - Returns 200 (used by test.sh to wait for server readiness)
@@ -12,6 +13,7 @@ GET endpoints (IP lookup):
   /ipv4            - Returns a plain-text IPv4 address (203.0.113.42)
   /ipv6            - Returns a plain-text IPv6 address (2001:db8::42)
   /ipv4-garbage    - Returns invalid text (for testing fallback behavior)
+  /dyndns-log      - Returns the recorded /dyndns* requests as JSON (for assertions)
 
 POST endpoints (netcup API variants):
   /api                 - Normal happy path: records match current IP, TTL=300
@@ -24,11 +26,24 @@ POST endpoints (netcup API variants):
   /api-session-refresh - First 4001 forces a new session ID that later calls must reuse
   /api-invalid-json    - Returns a 200 response body that is not JSON
   /api-invalid-payload - Returns JSON missing required fields
+  /api-5029            - infoDnsRecords returns statuscode 5029 (empty zone /
+                         CloudDNS-migrated domain, see GitHub issue #42)
+
+POST endpoints (CloudDNS DynDNS API variants, form-encoded like wsDynDns.php):
+  /dyndns              - Happy path: validates params + token, returns
+                         "Record(s) have been saved.", records the request
+  /dyndns-nochange     - Returns "No record update needed."
+  /dyndns-unauthorized - Always returns HTTP 401 (invalid token)
+  /dyndns-not-clouddns - HTTP 400: domain is not managed through CloudDNS
+  /dyndns-notfound     - HTTP 404: no matching domain in the account
+  /dyndns-500          - HTTP 500 internal error (retried by the client)
+  /dyndns-invalid-json - Returns a 200 response body that is not JSON
 """
 
 import json
 import socket
 import sys
+import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ---------------------------------------------------------------------------
@@ -37,6 +52,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 FAKE_IPV4 = "203.0.113.42"
 FAKE_IPV6 = "2001:db8::42"
 FAKE_SESSION_ID = "test-session-id-abc123"
+FAKE_DYNDNS_TOKEN = "test-dyndns-token"
 
 
 class MockHandler(BaseHTTPRequestHandler):
@@ -48,6 +64,8 @@ class MockHandler(BaseHTTPRequestHandler):
     session_refresh_triggered = False
     session_refresh_login_count = 0
     session_refresh_active_session_id = FAKE_SESSION_ID
+    # /dyndns*: every received request (path + form params), queryable via /dyndns-log.
+    dyndns_requests = []
 
     def log_message(self, format, *args):
         """Suppress default request logging to keep test output clean."""
@@ -66,7 +84,11 @@ class MockHandler(BaseHTTPRequestHandler):
             MockHandler.session_refresh_triggered = False
             MockHandler.session_refresh_login_count = 0
             MockHandler.session_refresh_active_session_id = FAKE_SESSION_ID
+            MockHandler.dyndns_requests = []
             self._respond(200, "OK")
+
+        elif self.path == "/dyndns-log":
+            self._respond_json(200, MockHandler.dyndns_requests)
 
         elif self.path == "/ipv4":
             self._respond(200, FAKE_IPV4)
@@ -91,6 +113,14 @@ class MockHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
+
+        # The CloudDNS DynDNS API (wsDynDns.php) receives form-encoded parameters
+        # and returns {"status": ..., "message": ...} — a separate code path from
+        # the JSON-body CCP API below.
+        if self.path.startswith("/dyndns"):
+            self._handle_dyndns(body)
+            return
+
         try:
             request = json.loads(body)
         except json.JSONDecodeError:
@@ -118,6 +148,7 @@ class MockHandler(BaseHTTPRequestHandler):
             "/api-zone-fail":       self._variant_zone_fail,
             "/api-update-fail":     self._variant_update_fail,
             "/api-logout-fail":     self._variant_logout_fail,
+            "/api-5029":            self._variant_records_5029,
         }
 
         handler = dispatch.get(self.path)
@@ -644,6 +675,35 @@ class MockHandler(BaseHTTPRequestHandler):
         else:
             self._unknown_action(action)
 
+    def _variant_records_5029(self, action, request):
+        """Login and infoDnsZone succeed, but infoDnsRecords returns statuscode 5029.
+
+        This is what the real CCP API returns both for genuinely empty zones and
+        for domains migrated to CloudDNS (GitHub issue #42)."""
+        if action == "login":
+            self._success_login()
+        elif action == "logout":
+            self._success_logout()
+        elif action == "infoDnsZone":
+            self._success_dns_zone(request)
+        elif action == "infoDnsRecords":
+            self._respond_json(200, {
+                "serverrequestid": "test",
+                "clientrequestid": "",
+                "action": "infoDnsRecords",
+                "status": "error",
+                "statuscode": 5029,
+                "shortmessage": "Getting DNS records failed",
+                "longmessage": "Can not get DNS records for zone. The zone does not example.com contain any DNS records.",
+                "responsedata": "",
+            })
+        elif action == "updateDnsRecords":
+            self._success_update_records(request)
+        elif action == "updateDnsZone":
+            self._success_update_zone(request)
+        else:
+            self._unknown_action(action)
+
     def _variant_logout_fail(self, action, request):
         """Everything works but logout fails."""
         if action == "login":
@@ -669,6 +729,63 @@ class MockHandler(BaseHTTPRequestHandler):
             self._success_update_zone(request)
         else:
             self._unknown_action(action)
+
+    # ==================================================================
+    # CloudDNS DynDNS API (wsDynDns.php)
+    # ==================================================================
+
+    def _handle_dyndns(self, body):
+        """Handles form-encoded POSTs to the /dyndns* endpoints."""
+        params = {k: v[0] for k, v in urllib.parse.parse_qs(body.decode()).items()}
+        MockHandler.dyndns_requests.append({"path": self.path, "params": params})
+
+        # Shared parameter validation, mirroring the real wsDynDns.php behavior.
+        if params.get("action") != "update":
+            self._respond_dyndns(404, "Requested 'action' is not known or not implemented.")
+            return
+        for field in ("token", "fqdn"):
+            if not params.get(field):
+                self._respond_dyndns(400, "'%s' is a required field." % field)
+                return
+        if "ipv4Address" not in params and "ipv6Address" not in params:
+            self._respond_dyndns(400, "At least one of the two fields need to be specified: 'ipv4Address', 'ipv6Address'.")
+            return
+
+        if self.path == "/dyndns":
+            if params["token"] != FAKE_DYNDNS_TOKEN:
+                self._respond_dyndns(401, "Unable to authenticate with provided token.")
+            else:
+                self._respond_dyndns(200, "Record(s) have been saved.", status="success")
+
+        elif self.path == "/dyndns-nochange":
+            self._respond_dyndns(200, "No record update needed.", status="success")
+
+        elif self.path == "/dyndns-unauthorized":
+            self._respond_dyndns(401, "Unable to authenticate with provided token.")
+
+        elif self.path == "/dyndns-not-clouddns":
+            self._respond_dyndns(400, "This domain is not managed through CloudDNS, for this reason this service will not work.")
+
+        elif self.path == "/dyndns-notfound":
+            self._respond_dyndns(404, "No matching domain for the given 'fqdn' was found in your account.")
+
+        elif self.path == "/dyndns-500":
+            self._respond_dyndns(500, "An error occurred while trying to update the DNS records, please reach out to our support.")
+
+        elif self.path == "/dyndns-invalid-json":
+            self._respond(200, "<!-- error page -->")
+
+        else:
+            self._respond(404, "Not Found")
+
+    def _respond_dyndns(self, http_status, message, status="error"):
+        """Send a CloudDNS DynDNS API style JSON response (Content-Type as served
+        by the real wsDynDns.php)."""
+        payload = {"status": status, "message": message}
+        self.send_response(http_status)
+        self.send_header("Content-Type", "text/json; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(json.dumps(payload).encode())
 
     # ==================================================================
     # Response helpers

@@ -62,19 +62,31 @@ shell_quote() {
     esac
 }
 
-# Generate $CONFIG_PATH from environment variables. Required: CUSTOMERNR,
-# APIKEY, APIPASSWORD, DOMAINLIST. Optional: USE_IPV4, USE_IPV6, CHANGE_TTL
-# (booleans), IPV4_ADDRESS_URL[_FALLBACK], IPV6_ADDRESS_URL[_FALLBACK],
-# RETRY_SLEEP, JITTER_MAX.
+# Generate $CONFIG_PATH from environment variables. At least one of DOMAINLIST
+# (CCP DNS API; then CUSTOMERNR, APIKEY, APIPASSWORD are required too) and
+# DOMAINLIST_CLOUDDNS_DYNDNS (CloudDNS DynDNS API; then CLOUDDNS_DYNDNS_APIKEY
+# is required) must be set. Optional: USE_IPV4, USE_IPV6, CHANGE_TTL (booleans),
+# IPV4_ADDRESS_URL[_FALLBACK], IPV6_ADDRESS_URL[_FALLBACK], RETRY_SLEEP,
+# JITTER_MAX, APIURL, CLOUDDNS_DYNDNS_APIURL.
 generate_config_from_env() {
-    missing=""
-    [ -n "${CUSTOMERNR:-}" ] || missing="$missing CUSTOMERNR"
-    [ -n "${APIKEY:-}" ] || missing="$missing APIKEY"
-    [ -n "${APIPASSWORD:-}" ] || missing="$missing APIPASSWORD"
-    [ -n "${DOMAINLIST:-}" ] || missing="$missing DOMAINLIST"
-    if [ -n "$missing" ]; then
-        echo "Missing required environment variable(s):$missing" >&2
-        echo "Either mount a config.php at $CONFIG_PATH or provide CUSTOMERNR, APIKEY, APIPASSWORD, and DOMAINLIST as environment variables." >&2
+    if [ -z "${DOMAINLIST:-}" ] && [ -z "${DOMAINLIST_CLOUDDNS_DYNDNS:-}" ]; then
+        echo "Missing required environment variable(s): DOMAINLIST (for the CCP DNS API) and/or DOMAINLIST_CLOUDDNS_DYNDNS (for CloudDNS-managed domains) — at least one must be set." >&2
+        echo "Either mount a config.php at $CONFIG_PATH or provide the configuration as environment variables." >&2
+        exit 1
+    fi
+    if [ -n "${DOMAINLIST:-}" ]; then
+        missing=""
+        [ -n "${CUSTOMERNR:-}" ] || missing="$missing CUSTOMERNR"
+        [ -n "${APIKEY:-}" ] || missing="$missing APIKEY"
+        [ -n "${APIPASSWORD:-}" ] || missing="$missing APIPASSWORD"
+        if [ -n "$missing" ]; then
+            echo "Missing required environment variable(s):$missing (required for the CCP DNS API because DOMAINLIST is set)." >&2
+            echo "Either mount a config.php at $CONFIG_PATH or provide CUSTOMERNR, APIKEY, and APIPASSWORD as environment variables." >&2
+            exit 1
+        fi
+    fi
+    if [ -n "${DOMAINLIST_CLOUDDNS_DYNDNS:-}" ] && [ -z "${CLOUDDNS_DYNDNS_APIKEY:-}" ]; then
+        echo "Missing required environment variable(s): CLOUDDNS_DYNDNS_APIKEY (required because DOMAINLIST_CLOUDDNS_DYNDNS is set; use an API key from the \"API-Keys\" section in the CCP, NOT a Legacy API key)." >&2
         exit 1
     fi
 
@@ -106,10 +118,27 @@ generate_config_from_env() {
     {
         echo "<?php"
         echo "// Generated from environment variables by docker-entrypoint.sh"
-        printf "define('CUSTOMERNR', '%s');\n" "$(escape_php_single "$CUSTOMERNR")"
-        printf "define('APIKEY', '%s');\n" "$(escape_php_single "$APIKEY")"
-        printf "define('APIPASSWORD', '%s');\n" "$(escape_php_single "$APIPASSWORD")"
-        printf "define('DOMAINLIST', '%s');\n" "$(escape_php_single "$DOMAINLIST")"
+        if [ -n "${CUSTOMERNR:-}" ]; then
+            printf "define('CUSTOMERNR', '%s');\n" "$(escape_php_single "$CUSTOMERNR")"
+        fi
+        if [ -n "${APIKEY:-}" ]; then
+            printf "define('APIKEY', '%s');\n" "$(escape_php_single "$APIKEY")"
+        fi
+        if [ -n "${APIPASSWORD:-}" ]; then
+            printf "define('APIPASSWORD', '%s');\n" "$(escape_php_single "$APIPASSWORD")"
+        fi
+        if [ -n "${DOMAINLIST:-}" ]; then
+            printf "define('DOMAINLIST', '%s');\n" "$(escape_php_single "$DOMAINLIST")"
+        fi
+        if [ -n "${DOMAINLIST_CLOUDDNS_DYNDNS:-}" ]; then
+            printf "define('DOMAINLIST_CLOUDDNS_DYNDNS', '%s');\n" "$(escape_php_single "$DOMAINLIST_CLOUDDNS_DYNDNS")"
+        fi
+        if [ -n "${CLOUDDNS_DYNDNS_APIKEY:-}" ]; then
+            printf "define('CLOUDDNS_DYNDNS_APIKEY', '%s');\n" "$(escape_php_single "$CLOUDDNS_DYNDNS_APIKEY")"
+        fi
+        if [ -n "${CLOUDDNS_DYNDNS_APIURL:-}" ]; then
+            printf "define('CLOUDDNS_DYNDNS_APIURL', '%s');\n" "$(escape_php_single "$CLOUDDNS_DYNDNS_APIURL")"
+        fi
         echo "define('USE_IPV4', $use_ipv4_php);"
         echo "define('USE_IPV6', $use_ipv6_php);"
         echo "define('CHANGE_TTL', $change_ttl_php);"

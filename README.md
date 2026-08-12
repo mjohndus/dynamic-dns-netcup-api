@@ -7,7 +7,9 @@
 ## Requirements
 * Be a netcup customer: https://www.netcup.de – or for international customers: https://www.netcup.eu
   * You don't have to be a domain reseller to use the necessary functions for this client – every customer with a domain may use it.
-* netcup API key and API password, which can be created within your CCP at https://www.customercontrolpanel.de
+* netcup API credentials, which can be created within your CCP at https://www.customercontrolpanel.de under *master data > API*:
+  * For domains on the classic DNS system: a **Legacy API key** and **API password** (section "Legacy-API-Keys")
+  * For domains managed through netcup **CloudDNS**: a regular **API key** (section "API-Keys") — see [CloudDNS-managed domains](#clouddns-managed-domains)
 * PHP-CLI with CURL extension
 * A domain :wink:
 
@@ -24,6 +26,7 @@
 * If configured, lowers TTL to 300 seconds for the domain on each run, if necessary
 * Caching: After a successful run, the current IP is cached locally. On subsequent runs, the DNS API is skipped entirely if the IP hasn't changed. Use `--force` to bypass the cache.
 * Jitter: A random delay (1–30 seconds by default) is applied before API calls to spread load when many users run the script via cron at the same time. Configurable via `JITTER_MAX` in config.
+* Supports domains migrated to netcup **CloudDNS** via the new CloudDNS DynDNS API (`DOMAINLIST_CLOUDDNS_DYNDNS`) — mixed setups with classic CCP DNS API domains work in one run
 * Hiding output (quiet option)
 
 ## Getting started
@@ -140,10 +143,13 @@ docker run -d --name dyndns \
 
 | Variable                       | Required | Default                       | Description                                                |
 | ------------------------------ | -------- | ----------------------------- | ---------------------------------------------------------- |
-| CUSTOMERNR                     | yes      | —                             | netcup customer number                                     |
-| APIKEY                         | yes      | —                             | netcup API key                                             |
-| APIPASSWORD                    | yes      | —                             | netcup API password                                        |
-| DOMAINLIST                     | yes      | —                             | Domain configuration (see [`config.dist.php`](https://github.com/stecklars/dynamic-dns-netcup-api/blob/master/config.dist.php) for the format) |
+| CUSTOMERNR                     | yes*     | —                             | netcup customer number                                     |
+| APIKEY                         | yes*     | —                             | netcup Legacy API key                                      |
+| APIPASSWORD                    | yes*     | —                             | netcup API password (Legacy)                               |
+| DOMAINLIST                     | yes*     | —                             | Domain configuration (see [`config.dist.php`](https://github.com/stecklars/dynamic-dns-netcup-api/blob/master/config.dist.php) for the format) |
+| DOMAINLIST_CLOUDDNS_DYNDNS     | no       | —                             | [CloudDNS-managed domains](#clouddns-managed-domains), same format as DOMAINLIST |
+| CLOUDDNS_DYNDNS_APIKEY          | no**     | —                             | netcup API key for CloudDNS domains (not the Legacy key)   |
+| CLOUDDNS_DYNDNS_APIURL         | no       | `https://customercontrolpanel.de/wsDynDns.php` | Override the CloudDNS DynDNS endpoint     |
 | USE_IPV4                       | no       | `true`                        | Update A records                                           |
 | USE_IPV6                       | no       | `false`                       | Update AAAA records                                        |
 | CHANGE_TTL                     | no       | `true`                        | Lower TTL to 300 seconds on each run                       |
@@ -154,6 +160,9 @@ docker run -d --name dyndns \
 | IPV6_ADDRESS_URL_FALLBACK      | no       | `https://v6.ident.me`         | Fallback IPv6 lookup URL                                   |
 | RETRY_SLEEP                    | no       | `30`                          | Seconds to wait between retries                            |
 | JITTER_MAX                     | no       | `30`                          | Max random delay before API calls (`0` to disable)         |
+
+\* Required when using the classic CCP DNS API (`DOMAINLIST`). A pure CloudDNS setup only needs `DOMAINLIST_CLOUDDNS_DYNDNS` and `CLOUDDNS_DYNDNS_APIKEY` — at least one of `DOMAINLIST` / `DOMAINLIST_CLOUDDNS_DYNDNS` must be set.
+\** Required if `DOMAINLIST_CLOUDDNS_DYNDNS` is set.
 
 Booleans accept `true` / `false` / `1` / `0` / `yes` / `no` / `on` / `off` (case-insensitive). Verify your env-var configuration in one-shot mode before going into cron mode:
 
@@ -185,6 +194,25 @@ This means irregular schedules are handled correctly. For example, a schedule li
 #### Docker notes
 * **"Permission denied" errors on Fedora, RHEL, or openSUSE**: These systems use SELinux, which blocks container access to mounted files even if file permissions look correct. Fix this by adding the `:z` flag to all volume mounts, e.g., `-v ./config.php:/app/config.php:ro,z -v dyndns-data:/app/data:z`. This does not affect NAS systems.
 * **IPv6**: Docker's default bridge network does not support IPv6. If you use `USE_IPV6=true`, run the container with `--network host` or configure Docker's IPv6 support.
+
+### CloudDNS-managed domains
+netcup is migrating domains to its new **CloudDNS** system (newly registered domains are typically CloudDNS-managed). The classic CCP DNS API cannot manage these zones anymore — it wrongly reports that the zone contains no DNS records (statuscode 5029) even though records exist. See [issue #42](https://github.com/stecklars/dynamic-dns-netcup-api/issues/42) for details. netcup has also announced in the CCP that the Legacy API will not be available anymore in the future, so expect more domains to move to CloudDNS over time.
+
+For these domains, netcup provides a separate **CloudDNS DynDNS API**, which this client supports:
+
+```php
+// config.php
+define('DOMAINLIST_CLOUDDNS_DYNDNS', 'myclouddomain.com: @, home');
+define('CLOUDDNS_DYNDNS_APIKEY', 'your-api-key');
+```
+
+To check which system a domain uses: in the CCP, go to *Domains*, click the magnifier icon next to the domain, and look at the tabs — a **CloudDNS** tab means the domain is CloudDNS-managed, a **DNS** tab means it still uses the classic system.
+
+* `DOMAINLIST_CLOUDDNS_DYNDNS` uses the same format as `DOMAINLIST`. A domain belongs in **either** list, never in both: domains in `DOMAINLIST` are updated through the CCP DNS API, domains in `DOMAINLIST_CLOUDDNS_DYNDNS` through the CloudDNS DynDNS API. Mixed setups work in a single run.
+* `CLOUDDNS_DYNDNS_APIKEY` is a regular netcup **API key**, created in your CCP under *master data > API* in the "API-Keys" section. It is *not* the **Legacy API key** — that one (together with the API password) is what `APIKEY`/`APIPASSWORD` use for the classic CCP DNS API. netcup lists the two key types separately on the same page.
+* If **all** your domains are CloudDNS-managed, you can omit `DOMAINLIST`, `CUSTOMERNR`, `APIKEY`, and `APIPASSWORD` entirely.
+* A and AAAA records are updated in a single API call per (sub)domain; missing records are created automatically.
+* The DynDNS API automatically sets the TTL of records it creates or updates to 300 seconds (ideal for dynamic DNS) — no manual TTL setup needed. The `CHANGE_TTL` option does not apply to these domains.
 
 ### CLI options
 Just add these Options after the command like `./update.php --quiet`

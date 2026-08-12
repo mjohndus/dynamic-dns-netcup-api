@@ -1,10 +1,16 @@
 <?php
 
 // Enter your netcup customer number here.
+// [Only needed for domains using the classic CCP DNS API (DOMAINLIST). If ALL your domains
+// are managed through CloudDNS (DOMAINLIST_CLOUDDNS_DYNDNS below), you can remove this.]
 define('CUSTOMERNR', '12345');
 
 
-// Enter your API-Password and -Key here - you can generate them in your CCP at https://ccp.netcup.net
+// Enter your API password and API key here - you can generate them in your CCP at
+// https://www.customercontrolpanel.de under master data > API, in the "Legacy-API-Keys"
+// section (netcup now calls these "Legacy" because they only work with the classic DNS API).
+// [Only needed for domains using the classic CCP DNS API (DOMAINLIST). If ALL your domains
+// are managed through CloudDNS (DOMAINLIST_CLOUDDNS_DYNDNS below), you can remove these.]
 define('APIPASSWORD', 'abcdefghijklmnopqrstuvwxyz');
 define('APIKEY', 'abcdefghijklmnopqrstuvwxyz');
 
@@ -26,6 +32,33 @@ define('DOMAINLIST', 'myfirstdomain.com: server, dddns; myseconddomain.com: @, *
 // define('DOMAIN', 'mydomain.com');
 // Enter subdomain to be used for dynamic DNS, alternatively '@' for domain root or '*' for wildcard. If the record doesn't exist, the script will create it.
 // define('HOST', 'server');
+
+
+// netcup is migrating domains to its new "CloudDNS" system. CloudDNS-managed domains can
+// NOT be updated through the classic CCP DNS API anymore - the API then wrongly reports
+// that the zone contains no DNS records (statuscode 5029). See
+// https://github.com/stecklars/dynamic-dns-netcup-api/issues/42 for more information.
+// List CloudDNS-managed domains here instead of in DOMAINLIST; they will be updated through
+// netcup's CloudDNS DynDNS webservice. Same format as DOMAINLIST. Use '@' for the domain
+// root and '*' for wildcard.
+// Notes:
+// - The DynDNS API automatically sets the TTL of records it creates or updates to
+//   300 seconds (ideal for dynamic DNS), so no manual TTL setup is needed. The
+//   CHANGE_TTL option does not apply to these domains.
+// - A domain should be listed EITHER here OR in DOMAINLIST, never in both.
+// [Optional; if ALL your domains are CloudDNS-managed, you can remove DOMAINLIST, CUSTOMERNR,
+// APIKEY and APIPASSWORD entirely.]
+// define('DOMAINLIST_CLOUDDNS_DYNDNS', 'myclouddomain.com: @, home');
+
+// API key for the CloudDNS DynDNS webservice. This is a regular (new-style) netcup API key,
+// created in your CCP under master data > API in the "API-Keys" section. It is NOT the
+// Legacy API key used for APIKEY above - netcup lists the two types separately.
+// [Required if DOMAINLIST_CLOUDDNS_DYNDNS is set.]
+// define('CLOUDDNS_DYNDNS_APIKEY', 'your-api-key');
+
+// URL of the netcup CloudDNS DynDNS webservice.
+// [Optional; will be set to default value 'https://customercontrolpanel.de/wsDynDns.php' if missing.]
+// define('CLOUDDNS_DYNDNS_APIURL', 'https://customercontrolpanel.de/wsDynDns.php');
 
 
 // Enter an URL to use to determine the public IPv4 address.

@@ -39,6 +39,17 @@ docker run --rm \
   dyndns:rc-$(git rev-parse --short HEAD) --run-once --force
 ```
 
+**CloudDNS DynDNS mode** (covers the wsDynDns.php path — the mock can't catch contract drift in the real endpoint). Requires a throwaway fqdn on a *CloudDNS-managed* domain; keep `RELEASE_TEST_CLOUDDNS_DOMAINLIST` and `CLOUDDNS_DYNDNS_APIKEY` in `.env.release`:
+
+```bash
+docker run --rm \
+  -e "DOMAINLIST_CLOUDDNS_DYNDNS=$RELEASE_TEST_CLOUDDNS_DOMAINLIST" \
+  -e CLOUDDNS_DYNDNS_APIKEY \
+  dyndns:rc-$(git rev-parse --short HEAD) --run-once --force
+```
+
+Expect `Record(s) have been saved.` (or `No record update needed.` on a repeat run) and no `Logged in successfully` line — pure-CloudDNS runs must not open a CCP session. Skip this block only if no CloudDNS-managed domain is available to you, and say so in the release notes.
+
 For each: confirm the run logs `Logged in successfully`, the expected `IPvN address has changed` or `hasn't changed`, `Logged out successfully`, and **no `PHP Warning` or `PHP Fatal` lines**. Then check the netcup CCP and verify the record actually has the IP the script reported.
 
 Also run a short cron-mode start-up against the same `TZ` as an end-to-end gut check. Tests 52a (Dockerfile installs `tzdata`) and 65a (PHP code overrides a pinned `date.timezone`) cover the *intent* of both layers; this verifies the *built artifact* behaves accordingly — that the `tzdata` package actually made it into the layer, that an upstream `php:8-cli-alpine` change didn't slip a new default through, and that nothing in the runtime stack quietly swallows `TZ`:

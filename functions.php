@@ -1,6 +1,6 @@
 <?php
 
-const VERSION = '6.2.1';
+const VERSION = '7.0.0';
 const SUCCESS = 'success';
 const USERAGENT = "dynamic-dns-netcup-api/" . VERSION ." (by stecklars)";
 
@@ -286,10 +286,46 @@ function getActiveApiSessionId($apisessionid)
     return $apisessionid;
 }
 
-//Returns list of domains with their subdomains for which we are supposed to perform changes
+// Parses a domain list string ("domain.tld: host1, host2; domain2.tld: host3") into
+// an array of ['domain.tld' => ['host1', 'host2'], ...]. Exits on format errors.
+// $constantName is only used in error messages ('DOMAINLIST' or 'DOMAINLIST_CLOUDDNS_DYNDNS').
+function parseDomainListString($domainlist, $constantName)
+{
+    $result = array();
+    $domainsExploded = array_filter(explode(';', preg_replace('/\s+/', '', $domainlist)), 'strlen');
+
+    foreach ($domainsExploded as $element) {
+        $arr = explode(':', $element, 2);
+        if (count($arr) !== 2 || $arr[0] === '' || $arr[1] === '') {
+            outputStderr(sprintf("Your configuration file is incorrect. Invalid %s entry \"%s\". Please check the format in config.dist.php. Exiting.", $constantName, $element));
+            exit(1);
+        }
+
+        $domain = $arr[0];
+        $subdomainarray = array_values(array_filter(explode(',', $arr[1]), 'strlen'));
+        if (count($subdomainarray) === 0) {
+            outputStderr(sprintf("Your configuration file is incorrect. Domain \"%s\" does not define any hosts in %s. Please check the format in config.dist.php. Exiting.", $domain, $constantName));
+            exit(1);
+        }
+
+        if (!isset($result[$domain])) {
+            $result[$domain] = array();
+        }
+
+        $result[$domain] = array_values(array_unique(array_merge($result[$domain], $subdomainarray)));
+    }
+
+    return $result;
+}
+
+//Returns list of domains with their subdomains which are updated through the CCP DNS API
 function getDomains()
 {
-    if (! defined('DOMAINLIST')) {
+    if (defined('DOMAINLIST')) {
+        return parseDomainListString(DOMAINLIST, 'DOMAINLIST');
+    }
+
+    if (defined('DOMAIN') || defined('HOST')) {
         outputWarning("You are using an outdated configuration format (for configuring domain / host). This is deprecated and might become incompatible very soon. Please update to the new configuration format (using 'DOMAINLIST'). Please check the documentation in config.dist.php for more information.");
         if (! defined('DOMAIN')) {
             outputStderr("Your configuration file is incorrect. You did not configure any domains ('DOMAINLIST' or 'DOMAIN' option (deprecated) in the config). Please check the documentation in config.dist.php. Exiting.");
@@ -302,31 +338,24 @@ function getDomains()
         return array(DOMAIN => array(HOST));
     }
 
-    $result = array();
-    $domainsExploded = array_filter(explode(';', preg_replace('/\s+/', '', DOMAINLIST)), 'strlen');
-
-    foreach ($domainsExploded as $element) {
-        $arr = explode(':', $element, 2);
-        if (count($arr) !== 2 || $arr[0] === '' || $arr[1] === '') {
-            outputStderr(sprintf("Your configuration file is incorrect. Invalid DOMAINLIST entry \"%s\". Please check the format in config.dist.php. Exiting.", $element));
-            exit(1);
-        }
-
-        $domain = $arr[0];
-        $subdomainarray = array_values(array_filter(explode(',', $arr[1]), 'strlen'));
-        if (count($subdomainarray) === 0) {
-            outputStderr(sprintf("Your configuration file is incorrect. Domain \"%s\" does not define any hosts in DOMAINLIST. Please check the format in config.dist.php. Exiting.", $domain));
-            exit(1);
-        }
-
-        if (!isset($result[$domain])) {
-            $result[$domain] = array();
-        }
-
-        $result[$domain] = array_values(array_unique(array_merge($result[$domain], $subdomainarray)));
+    // Pure-CloudDNS configurations are valid without any CCP DNS API domains.
+    if (defined('DOMAINLIST_CLOUDDNS_DYNDNS')) {
+        return array();
     }
 
-    return $result;
+    outputStderr("Your configuration file is incorrect. You did not configure any domains ('DOMAINLIST' for the CCP DNS API, 'DOMAINLIST_CLOUDDNS_DYNDNS' for CloudDNS-managed domains, or 'DOMAIN' (deprecated)). Please check the documentation in config.dist.php. Exiting.");
+    exit(1);
+}
+
+// Returns the list of CloudDNS-managed domains with their subdomains which are updated
+// through the netcup CloudDNS DynDNS API, or an empty array if none are configured.
+function getCloudDnsDomains()
+{
+    if (! defined('DOMAINLIST_CLOUDDNS_DYNDNS')) {
+        return array();
+    }
+
+    return parseDomainListString(DOMAINLIST_CLOUDDNS_DYNDNS, 'DOMAINLIST_CLOUDDNS_DYNDNS');
 }
 
 function isIPV4Valid($ipv4)
@@ -549,6 +578,13 @@ function infoDnsRecords($domainname, $customernr, $apikey, $apisessionid)
         return $result;
     }
 
+    // Statuscode 5029 ("zone contains no records") is also what the CCP DNS API wrongly
+    // returns for domains which were migrated to netcup CloudDNS, even when records exist.
+    if ($result['statuscode'] === 5029) {
+        outputStderr(sprintf('Error while getting DNS Record info for "%s": %s [ADDITIONAL INFORMATION: The CCP DNS API reports this either when the zone is genuinely empty, OR when the domain has been migrated to netcup CloudDNS - in that case the CCP DNS API cannot manage the zone anymore even though records exist. If "%s" is managed through CloudDNS, move it from DOMAINLIST to DOMAINLIST_CLOUDDNS_DYNDNS and configure a CLOUDDNS_DYNDNS_APIKEY in config.php. See https://github.com/stecklars/dynamic-dns-netcup-api/issues/42 for more information.] Exiting.', $domainname, $result['longmessage'], $domainname));
+        return false;
+    }
+
     outputStderr(sprintf("Error while getting DNS Record info: %s Exiting.", $result['longmessage']));
     return false;
 }
@@ -669,4 +705,105 @@ function updateDnsRecordsForIP($infoDnsRecords, $subdomain, $domain, $apisession
             exit(1);
         }
     }
+}
+
+// --- netcup CloudDNS DynDNS API (wsDynDns.php) ---
+// CloudDNS-managed domains cannot be updated through the CCP DNS API anymore. netcup
+// provides a separate DynDNS webservice for them, authenticated with a new-style netcup
+// API key (CLOUDDNS_DYNDNS_APIKEY) instead of the Legacy API key + password pair.
+
+// Maps a subdomain + domain to the fqdn parameter of the CloudDNS DynDNS API ('@' = domain root).
+function buildCloudDnsFqdn($subdomain, $domain)
+{
+    if ($subdomain === '@') {
+        return $domain;
+    }
+    return $subdomain . '.' . $domain;
+}
+
+// Create cURL handler for form-POSTing to the CloudDNS DynDNS API.
+// Unlike the CCP API handler, this must NOT set CURLOPT_FAILONERROR: the DynDNS API
+// returns its JSON error message in the body of 400/401/404/500 responses.
+// POST (instead of GET) keeps the token out of URLs and log lines.
+function initializeCurlHandlerPostCloudDnsDynDns($params)
+{
+    $ch = curl_init(CLOUDDNS_DYNDNS_APIURL);
+    $curlOptions = array(
+        CURLOPT_POST => 1,
+        CURLOPT_USERAGENT => USERAGENT,
+        CURLOPT_TIMEOUT => 30,
+        CURLOPT_RETURNTRANSFER => 1,
+        CURLOPT_POSTFIELDS => http_build_query($params),
+    );
+    curl_setopt_array($ch, $curlOptions);
+    return $ch;
+}
+
+// Validates/normalizes a CloudDNS DynDNS API response body.
+// Returns ['status' => ..., 'message' => ...] or false if the body is malformed.
+function normalizeCloudDnsDynDnsResponse($response)
+{
+    $result = json_decode($response, true);
+
+    if (!is_array($result) || !isset($result['status']) || !is_string($result['status'])) {
+        return false;
+    }
+
+    if (!isset($result['message']) || !is_string($result['message'])) {
+        return false;
+    }
+    $result['message'] = trim(preg_replace('/\s+/', ' ', $result['message']));
+
+    return $result;
+}
+
+// Updates the A and/or AAAA record for one fqdn via the CloudDNS DynDNS API in a single call.
+// $publicIPv4 / $publicIPv6 may be null when the respective IP version is disabled.
+// Returns true on success (including "No record update needed."), false on failure.
+function updateCloudDnsDynDns($fqdn, $publicIPv4 = null, $publicIPv6 = null)
+{
+    outputStdout(sprintf('Updating DNS records for "%s" via the CloudDNS DynDNS API.', $fqdn));
+
+    $params = array(
+        'action' => 'update',
+        'token' => CLOUDDNS_DYNDNS_APIKEY,
+        'fqdn' => $fqdn,
+    );
+    if ($publicIPv4 !== null) {
+        $params['ipv4Address'] = $publicIPv4;
+    }
+    if ($publicIPv6 !== null) {
+        $params['ipv6Address'] = $publicIPv6;
+    }
+
+    $ch = initializeCurlHandlerPostCloudDnsDynDns($params);
+    // Well-formed API errors (4xx with a JSON body) are final answers and handled below;
+    // transport errors, malformed bodies, and 5xx responses are retried.
+    $validator = function ($response) use ($ch) {
+        return normalizeCloudDnsDynDnsResponse($response) !== false
+            && curl_getinfo($ch, CURLINFO_RESPONSE_CODE) < 500;
+    };
+    $response = executeCurlWithRetries($ch, 3, $validator);
+
+    if ($response === false) {
+        outputStderr("Max retries reached. Exiting due to cURL network error or invalid answer of the CloudDNS DynDNS API.");
+        curl_close($ch);
+        return false;
+    }
+
+    $httpCode = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    curl_close($ch);
+    $result = normalizeCloudDnsDynDnsResponse($response);
+
+    if ($result['status'] === SUCCESS) {
+        outputStdout(sprintf('CloudDNS DynDNS API: %s', $result['message']));
+        return true;
+    }
+
+    if ($httpCode === 401) {
+        $result['message'] = $result['message'] . ' [ADDITIONAL INFORMATION: HTTP 401 usually means the CLOUDDNS_DYNDNS_APIKEY in your config is wrong. It must be an API key from the "API-Keys" section in your CCP (master data > API) - NOT a Legacy API key, which only works for the classic CCP DNS API.]';
+    }
+
+    outputStderr(sprintf('Error from the CloudDNS DynDNS API for "%s" (HTTP %d): %s Exiting.', $fqdn, $httpCode, $result['message']));
+    return false;
 }
