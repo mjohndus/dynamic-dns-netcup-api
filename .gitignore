@@ -5,3 +5,4 @@ config.unit.php.tmp.php
 config.test.php
 .env.release
 .php-cs-fixer.cache
+opencode.json
