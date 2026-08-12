@@ -795,6 +795,8 @@ assert_output "gets domain info" "Successfully received Domain info"
 assert_output "gets DNS records" "Successfully received DNS record data"
 assert_output "detects no IPv4 change" "IPv4 address hasn't changed"
 assert_output "logs out" "Logged out successfully"
+assert_output_missing "no PHP warnings or deprecations" "PHP Warning"
+assert_output_missing "no deprecation notices" "Deprecated"
 
 # --- 9. IP changed: triggers DNS record update ---
 # The mock /api-ip-changed returns DNS records with IP 1.1.1.1 (stale).
@@ -2647,6 +2649,8 @@ assert_output "updates root fqdn" 'Updating DNS records for "example.com" via th
 assert_output "updates subdomain fqdn" 'Updating DNS records for "home.example.com" via the CloudDNS DynDNS API'
 assert_output_missing "no CCP login" "Logged in successfully"
 assert_output_missing "no CCP logout" "Logged out successfully"
+assert_output_missing "no PHP warnings or deprecations" "PHP Warning"
+assert_output_missing "no deprecation notices" "Deprecated"
 dyndns_log=$(curl -s "http://localhost:$MOCK_PORT/dyndns-log")
 dyndns_count=$(printf '%s' "$dyndns_log" | grep -oF '"path": "/dyndns"' | wc -l | tr -d '[:space:]')
 if [ "$dyndns_count" -eq 2 ]; then

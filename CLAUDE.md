@@ -51,5 +51,5 @@ Run tests with `./tests/test.sh`. Requires Bash, PHP-CLI, and Python 3.
 - `functions.php` top-level code runs on include — don't `require` it without passing appropriate CLI args.
 - PHP constants can't be redefined — tests needing different config values need separate PHP processes.
 - The `CURLOPT_FAILONERROR` option is set on all cURL handles — HTTP errors (4xx/5xx) cause `curl_exec` to return `false`.
-- `curl_close()` must be called on every code path. Check for handle leaks when modifying `sendRequest()` or `fetchIPWithFallback()`.
+- Do NOT call `curl_close()` — it has been a no-op since PHP 8.0 (handles are objects freed by GC) and is deprecated since PHP 8.5, where it emits a `Deprecated` notice. The main success-path tests assert that no `Deprecated` notices appear in output.
 - Cache file writes use `file_put_contents` which is atomic for small writes on most filesystems, but there is no `flock()` — concurrent cron runs could theoretically produce a corrupted cache file (handled gracefully by treating invalid JSON as a cache miss).

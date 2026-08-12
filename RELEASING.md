@@ -50,7 +50,7 @@ docker run --rm \
 
 Expect `Record(s) have been saved.` (or `No record update needed.` on a repeat run) and no `Logged in successfully` line — pure-CloudDNS runs must not open a CCP session. Skip this block only if no CloudDNS-managed domain is available to you, and say so in the release notes.
 
-For each: confirm the run logs `Logged in successfully`, the expected `IPvN address has changed` or `hasn't changed`, `Logged out successfully`, and **no `PHP Warning` or `PHP Fatal` lines**. Then check the netcup CCP and verify the record actually has the IP the script reported.
+For each: confirm the run logs `Logged in successfully`, the expected `IPvN address has changed` or `hasn't changed`, `Logged out successfully`, and **no `PHP Warning`, `PHP Fatal`, or `Deprecated` lines** (the Alpine image's PHP is often newer than local PHP and surfaces fresh deprecations first). Then check the netcup CCP and verify the record actually has the IP the script reported.
 
 Also run a short cron-mode start-up against the same `TZ` as an end-to-end gut check. Tests 52a (Dockerfile installs `tzdata`) and 65a (PHP code overrides a pinned `date.timezone`) cover the *intent* of both layers; this verifies the *built artifact* behaves accordingly — that the `tzdata` package actually made it into the layer, that an upstream `php:8-cli-alpine` change didn't slip a new default through, and that nothing in the runtime stack quietly swallows `TZ`:
 
