@@ -5,7 +5,7 @@ services:
     # entirely via environment variables instead, remove the config.php
     # line below and uncomment the configuration env vars further down.
     volumes:
-      - ./config.php:/app/config.php:ro
+      - ./config.php:/app/config.php:ro,z
       - dyndns-data:/app/data
     environment:
       - "CRON_SCHEDULE=*/5 * * * *"
